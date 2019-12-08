@@ -16,13 +16,39 @@ import (
 )
 
 var (
-	device       string = "eth0"
-	snapshot_len int32  = 1024
-	promiscuous  bool   = false
+	snapshot_len int32 = 1024
+	promiscuous  bool
 	err          error
-	timeout      time.Duration = 30 * time.Second
-	handle       *pcap.Handle
+	timeout      = 30 * time.Second
 )
+
+type scanner struct {
+	iface        *net.Interface
+	dst, gw, src net.IP
+	handle       *pcap.Handle
+}
+
+func newScanner(ip net.IP, router routing.Router) (*scanner, error) {
+	s := &scanner{
+		dst: ip,
+	}
+	iface, gw, src, err := router.Route(ip)
+	if err != nil {
+		return nil, err
+	}
+	log.Printf("scanning ip %v with iterface %v, gateway %v, src %v", ip, iface.Name, gw, src)
+	s.gw, s.src, s.iface = gw, src, iface
+	handle, err := pcap.OpenLive(`rpcap://`+iface.Name, 65535, true, time.Second*1)
+	if err != nil {
+		return nil, err
+	}
+	s.handle = handle
+	return s, nil
+}
+
+func (s *scanner) close() {
+	s.handle.Close()
+}
 
 func isOpen(host string, port int, timeout time.Duration) bool {
 	conn, err := net.DialTimeout("tcp", fmt.Sprintf("%s:%d", host, port), timeout)
@@ -49,24 +75,15 @@ func localIP() (net.IP, error) {
 }
 
 // 获取远端MAC地址
-func remoteMac(dstip net.IP) (net.HardwareAddr, error) {
+func (s *scanner) remoteMac() (net.HardwareAddr, error) {
 	var dstmac net.HardwareAddr
-	router, err := routing.New()
-	if err != nil {
-		log.Fatal("routing error:", err)
-	}
-	iface, gw, srcip, err := router.Route(dstip)
-	if err != nil {
-		return nil, err
-	}
-	log.Printf("scanning ip %v with interface %v, gateway %v, src %v", dstip, iface.Name, gw, srcip)
-	arpDst := dstip
-	if gw != nil {
-		arpDst = gw
+	arpDst := s.dst
+	if s.gw != nil {
+		arpDst = s.gw
 	}
 	// 构造ARP包
 	eth := &layers.Ethernet{
-		SrcMAC:       iface.HardwareAddr,
+		SrcMAC:       s.iface.HardwareAddr,
 		DstMAC:       net.HardwareAddr{0xff, 0xff, 0xff, 0xff, 0xff, 0xff},
 		EthernetType: layers.EthernetTypeARP,
 	}
@@ -76,8 +93,8 @@ func remoteMac(dstip net.IP) (net.HardwareAddr, error) {
 		HwAddressSize:     6,
 		ProtAddressSize:   4,
 		Operation:         layers.ARPRequest,
-		SourceHwAddress:   []byte(iface.HardwareAddr),
-		SourceProtAddress: []byte(srcip),
+		SourceHwAddress:   []byte(s.iface.HardwareAddr),
+		SourceProtAddress: []byte(s.src),
 		DstHwAddress:      []byte{0, 0, 0, 0, 0, 0},
 		DstProtAddress:    []byte(arpDst),
 	}
@@ -93,19 +110,11 @@ func remoteMac(dstip net.IP) (net.HardwareAddr, error) {
 	if err != nil {
 		return dstmac, err
 	}
-
-	handle, err := pcap.OpenLive(`rpcap://`+iface.Name, 65535, true, time.Second*1)
-	if err != nil {
-		return dstmac, err
-	}
-	defer handle.Close()
-
 	var wg sync.WaitGroup
-	handle.SetBPFFilter(fmt.Sprintf("arp and ether host %s", iface.HardwareAddr.String()))
-	packetSource := gopacket.NewPacketSource(handle, handle.LinkType())
-
+	log.Printf("Only capturing ARP packets")
+	s.handle.SetBPFFilter(fmt.Sprintf("arp and ether host %s", s.iface.HardwareAddr.String()))
+	packetSource := gopacket.NewPacketSource(s.handle, s.handle.LinkType())
 	macChan := make(chan net.HardwareAddr, 1)
-
 	wg.Add(1)
 	go func() {
 		stop := false
@@ -125,7 +134,7 @@ func remoteMac(dstip net.IP) (net.HardwareAddr, error) {
 			}
 			if arpLayer := packet.Layer(layers.LayerTypeARP); arpLayer != nil {
 				arp_, _ := arpLayer.(*layers.ARP)
-				if bytes.Equal(arp_.SourceProtAddress, dstip) && arp_.Operation == 2 {
+				if bytes.Equal(arp_.SourceProtAddress, s.dst) && arp_.Operation == 2 {
 					macChan <- arp_.SourceHwAddress
 					break
 				}
@@ -149,68 +158,30 @@ func main() {
 	timeout := flag.Duration("timeout", time.Millisecond*200, "timeout")
 	flag.Parse()
 
-	ports := []int{}
+	var ports []int
 	wg := &sync.WaitGroup{}
 	mutex := &sync.Mutex{}
 
-	devices, err := pcap.FindAllDevs()
+	router, err := routing.New()
+	if err != nil{
+		log.Fatalf("routing err:", err)
+	}
+	var ip net.IP
+	if ip = net.ParseIP(*hostname); ip == nil{
+		log.Fatalf("non-ip target: %s", *hostname)
+	}
+
+	s, err := newScanner(ip, router)
 	if err != nil {
-		fmt.Printf("can't get device err is %v", err)
+		log.Printf("unable to create scanner for %v: %v", ip, err)
+		return
 	}
-	fmt.Println("Devices found:")
-	for _, device := range devices {
-		fmt.Println("\nName: ", device.Name)
-		fmt.Println("Description: ", device.Description)
-		fmt.Println("Devices addresses: ", device.Description)
-		for _, address := range device.Addresses {
-			fmt.Println("- IP address: ", address.IP)
-			fmt.Println("- Subnet mask: ", address.Netmask)
-		}
+	if err := s.scan(); err != nil {
+		log.Printf("unable to scan %v: %v", ip, err)
+		return
 	}
+	defer s.close()
 
-	// 开启设备
-	handle, err = pcap.OpenLive(device, snapshot_len, promiscuous, timeout)
-	if err != nil {
-		log.Fatal(err)
-	}
-	defer handle.Close()
-
-	// 开始构造包
-	// 本地MAC
-	srcmac, err := localMac()
-	// 目的MAC
-	dstmac, err := remoteMac(srcmac)
-
-	eth := layers.Ethernet{
-		SrcMAC:       srcmac,
-		DstMAC:       dstmac,
-		EthernetType: layers.EthernetTypeIPv4,
-	}
-	ip4 := layers.IPv4{
-		SrcIP:    srcip,
-		DstIP:    dstip,
-		Version:  4,
-		TTL:      64,
-		Protocol: layers.IPProtocolTCP,
-	}
-	tcp := layers.TCP{
-		SrcPort: 54321,
-		DstPort: 0, // will be incremented during the scan
-		SYN:     true,
-	}
-
-	buffer := gopacket.NewSerializeBuffer()
-	err = gopacket.SerializeLayers(
-		buffer,
-		gopacket.SerializeOptions{
-			ComputeChecksums: true, // automatically compute checksums
-			FixLengths:       true,
-		},
-		&eth, &ip4, &tcp,
-	)
-	if err != nil {
-		log.Fatal(err)
-	}
 
 	for port := *startPort; port <= *endPort; port++ {
 		wg.Add(1)
